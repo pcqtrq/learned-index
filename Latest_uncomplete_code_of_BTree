@@ -1,0 +1,515 @@
+#include "device_launch_parameters.h"
+#include "cuda_runtime.h"
+#include "device_functions.h"
+
+
+#include<iostream>
+#include<fstream>
+#include<string>
+#include<random>
+#include<stdlib.h>
+#include<vector>
+#include<time.h>
+#include<stdio.h>
+#include "math.h"
+#include "BTree.h"
+
+using namespace std;
+
+struct Data {
+	int edge_num[2];
+	string str;
+};
+vector<Data> CPU_Data;     //用于保存数据
+
+// ios::sync_with_stdio(false);
+
+#define Key_Length  7        //记录的键值最大长度
+#define File_num  1e4       //记录数量
+
+
+const int MAX_Record = 1e3;      //设置的子集最大记录数量（不能保证划分后的记录数量）
+const int  MAX_Error = 100;       //最大误差
+
+
+string path[2] = { "C:\\data\\read.txt","C:\\data\\search.txt" };
+
+
+dim3 grid(6, 4), block(32, 16);
+
+
+
+const int block_num = 6 * 4;         //线程块的大小
+const int Iteration_recordNum = 6 * 4 * 32 * 16;
+
+
+int key_num = 0;                //未重复记录数量
+const int sharedMem_size = 32 * 32 * sizeof(float);
+
+const int K = 6;                //限制的最大子数据集的记录数量，第二阶段划分数据集个数，
+							   //线性逼近函数的参数个数，逼近过程中的学习率
+
+
+vector<int*> standard_aim;
+int *temporary_key = NULL;
+int *temporary_result = NULL;
+int *aim_position = NULL;
+int *aim_offset = NULL;
+
+//GPU中的常量内存
+__constant__ float GPU_Param[Key_Length + 1] = { 0 };
+__constant__ float Num_Flag[K];
+
+//GPU_edge_num和GPU_Data保存着GPU中所有的元数据
+
+__device__ int *GPU_Data = NULL;
+__device__ int *GPU_aim_num=NULL;
+__device__ int *GPU_aim_offset=NULL;
+
+//GPU_run_position以及GPU_run_result是GPU中一次Iteration的最大计算数量，其size被设置为常量
+
+__device__ int *GPU_run_position = NULL;
+__device__ float *GPU_run_result = NULL;
+__device__ float *Model_Param = NULL;
+
+
+//Paration_num保存GPU中所有数据的进行顶层划分后的子节点编号计算结果
+__device__ int *Partition_num = NULL;
+
+__device__ float *public_memory = NULL;
+
+__device__ float result_offset[2];  //用于保存结果的偏移量
+
+//函数
+void create_IO_File(string path[2]);
+void deal_IO_File(string path[2]);
+void Model_Train(int iteration_num);
+
+
+__global__ void Init_position(int Std_time, int iteration_num, int *GPU_run_position);
+__global__ void Partition(int* GPU_Data, int *GPU_run_postion, int *Partition_num, int iteration_num, int Std_time);
+__global__ void Train_Forward(int *GPU_run_position, int *GPU_Data, float *GPU_run_result,int iteration_num);
+__global__ void sum_average(float *GPU_run_result, float *sum_result, int length);
+__host__ void deal_dataset(vector<int> Node_vector,int k);
+__global__ void Offset_average(float *GPU_run_result, int *GPU_aim_num, int* GPU_run_position,float *sum_result, int iteration_num);
+
+__global__ void show();
+
+static void Error_judge(cudaError Error, int line) {                    //用于判断数据传送是否出错
+	if (Error != cudaSuccess) {
+		cout << "在第" << line << "行出现错误！" << endl;
+
+		cout << "错误代码为：" << cudaGetErrorString(Error) << endl;
+
+		//清空关联的GPU资源并等待
+
+		cudaDeviceReset();
+
+		system("pause");
+	}
+
+}
+
+static void Error_CPU(int flag, int line) {
+	if (flag != 0) {
+		cout << "在第" << line << "行出现错误！" << endl;
+		system("pause");
+	}
+
+}
+
+#define HANDLE_ERROR(err) (Error_judge(err,__LINE__))
+#define CPU_ERROR(err) (Error_CPU(err,__LINE__))
+
+
+
+int main() {
+//	create_IO_File(path);
+	
+	deal_IO_File(path);
+	
+	key_num = CPU_Data.size();
+	
+	cout << "文件处理完毕，大小为：  "<<key_num << endl;
+	HANDLE_ERROR(cudaMalloc((void**)&GPU_aim_num, key_num * sizeof(float)));
+	HANDLE_ERROR(cudaMalloc((void**)&GPU_aim_offset, key_num * sizeof(int)));
+	if (1) {
+		int y = (block_num + 31) / 32;
+		HANDLE_ERROR(cudaMalloc((void**)&public_memory, y * 32 * sizeof(int)));
+	}
+	if (temporary_key = (int *)malloc(key_num*Key_Length * sizeof(int)));        //读取数据
+	else {
+		CPU_ERROR(1);
+	}
+	
+	if (temporary_result = (int *)malloc(key_num * sizeof(int)));           //用于存储数据集划分结果
+	else {
+		CPU_ERROR(1);
+	}
+	if (aim_position = (int *)malloc(key_num * sizeof(int)));           //用于存储数据集划分结果
+	else {
+		CPU_ERROR(1);
+	}
+	if (aim_offset = (int *)malloc(key_num * sizeof(int)));           //用于存储数据集划分结果
+	else {
+		CPU_ERROR(1);
+	}
+
+	for (int i = 0; i < key_num; i++) {
+		string str = CPU_Data[i].str;
+		int u = 0, m = i * Key_Length;
+		for (auto c : str) {
+			temporary_key[m + u] = c - 45;
+			u++;
+		}
+		int p = 11;
+		for (; u < Key_Length; u++) {
+			temporary_key[m + u] = 0;
+		}
+		u = CPU_Data[i].edge_num[0] + CPU_Data[i].edge_num[1];
+		m = CPU_Data[i].edge_num[1] - CPU_Data[i].edge_num[0];
+		aim_position[i] =u / 2;
+		aim_offset[i] = m > 0 ? m : -m;
+	}
+
+	if (1) {          //释放CPPU_Data
+		vector<Data> k;
+		k.swap(CPU_Data);
+	}
+
+	HANDLE_ERROR(cudaSetDevice(0));
+
+	//设定将数据一次性 传递到GPU中
+	HANDLE_ERROR(cudaMalloc((void**)&GPU_Data, key_num*Key_Length * sizeof(int)));
+	HANDLE_ERROR(cudaMemcpy(GPU_Data, temporary_key, key_num*Key_Length * sizeof(int), cudaMemcpyHostToDevice));
+
+	//将训练目标数据传到GPU中
+	HANDLE_ERROR(cudaMemcpy(GPU_aim_num,aim_position,  key_num * sizeof(int), cudaMemcpyHostToDevice));
+	HANDLE_ERROR(cudaMemcpy(GPU_aim_offset, aim_offset, key_num*sizeof(int), cudaMemcpyHostToDevice));
+
+
+	//设定iteration的GPU内存大小
+	HANDLE_ERROR(cudaMalloc((void**)&GPU_run_result, Iteration_recordNum * sizeof(float)));
+	HANDLE_ERROR(cudaMalloc((void**)&GPU_run_position, Iteration_recordNum * sizeof(int)));
+
+	//划分结果的内存申请
+	HANDLE_ERROR(cudaMalloc((void**)&Partition_num, key_num * sizeof(int)));
+	//
+
+
+
+	//子节点数量计算。
+	int leaf_node = (key_num + MAX_Record - 1) / MAX_Record;    //得到第二层子节点的个数
+	cout << "叶子节点个数为：   "<<leaf_node << endl;
+	//cout << "叶子节点个数为   :  " << leaf_node << endl;
+
+	////子模型参数保存内存空间申请
+	HANDLE_ERROR(cudaMalloc((void**)&Model_Param, (leaf_node)*(Key_Length + 1) * sizeof(float)));
+
+
+	//GPU中的一些常量内存初始化
+	float aa[K] = { leaf_node,Iteration_recordNum,Key_Length,0.001,MAX_Error,0 };
+	HANDLE_ERROR(cudaMemcpyToSymbol(Num_Flag, aa, K * sizeof(float)));
+
+
+	//进行数据集划分
+	int num1 = key_num / Iteration_recordNum;
+	int num2 = key_num % Iteration_recordNum;
+	if (num2 != 0) num1++;
+	//printf("键值数量：  %d  ,划分的数据集的数量：   %d\n", key_num, num1);
+
+	int Std_time = 0;
+	int iteration_num = 0;
+	while (Std_time < num1) {
+		if (Std_time == num1 - 1 && num2 != 0) {
+			iteration_num = num2;
+		}
+		else {
+			iteration_num = Iteration_recordNum;
+		}
+		//printf("次数：   %d，数据量：   %d\n",Std_time,iteration_num);
+
+		Init_position << <grid, block >> > (Std_time, iteration_num, GPU_run_position);
+
+
+		Partition << <grid, block >> > (GPU_Data, GPU_run_position, Partition_num, iteration_num, Std_time);
+
+		Std_time++;
+	}
+
+	HANDLE_ERROR(cudaMemcpy(temporary_result, Partition_num, key_num * sizeof(int), cudaMemcpyDeviceToHost));
+
+	cout << "开始数据划分" << endl;
+	;
+	vector<vector<int>> Node_vector;
+	for (int i = 0; i < aa[0]; i++) {
+		vector<int> p;                  //每个叶子节点使用一个vector<int>保存相关记录的编号
+		Node_vector.push_back(p);
+	}
+	int temp = 0;
+	for (int i = 0; i < key_num; i++) {        //划分成leaf_node个子数据集，每个数据集中的数据个数不确定
+
+		temp = temporary_result[i];
+		Node_vector[temp].push_back(i);
+	}
+	
+	printf("节点模型训练：\n");
+	printf("...\n");
+	system("pause");
+	float Param[Key_Length + 1];                  //第一次的参数用于划分，尽量不要太小（不要小于1）
+	int sum = 0;                                  //用于初始化后面线性逼近的初始化参数
+
+	std::default_random_engine generator(time(NULL));
+	std::uniform_int_distribution<int> dis(0, 100);
+
+	for (int i = 0; i < Key_Length + 1; i++) {
+		int y = dis(generator);
+		Param[i] = 1.0*(y + 10) / (y + 0.001);
+		sum += Param[i];
+	}
+	HANDLE_ERROR(cudaMemcpyToSymbol(GPU_Param, Param, sizeof(Param), 0, cudaMemcpyHostToDevice));
+
+	for (int i = 0; i < aa[0]; i++) {
+
+		int y = Node_vector[i].size();
+		if (y == 0) continue;
+		deal_dataset(Node_vector[i],y);
+	
+	}
+
+
+	free(temporary_key);
+	free(temporary_result);
+	cudaFree(public_memory);
+	cudaFree(GPU_aim_num);
+	cudaFree(GPU_Data);
+	cudaFree(GPU_run_position);
+	cudaFree(GPU_run_result);
+	cudaFree(Partition_num);
+
+
+
+
+
+
+}
+
+__host__ void create_IO_File(string path[2]) {
+	int j = 0, y = 0;
+	std::default_random_engine engineer(time(NULL));
+	std::uniform_int_distribution<int> dis(0, 20);
+
+	ofstream fp(path[0]);
+	if (fp.fail()) {
+		cerr << path[0] << " cannot open to write \n";
+		system("pause");
+	}
+	for (int i = 0; i < File_num; i++) {
+		j = dis(engineer);
+		y = i;
+		for (int n = 0; n < j&&y < File_num; n++, y++) {
+			fp << i << "\n";
+		}
+	}
+	if (fp.is_open()) fp.close();        //关闭文件写入流
+}
+
+__host__ void deal_IO_File(string path[2]) {
+	ifstream inf(path[0]);
+
+	if (inf.fail()) {
+		cerr << path[0] << " cannot open \n";
+	}
+	string str = "",s="";
+	int i = 0, flag = 0;
+	struct Data data;
+
+	while (getline(inf, s))
+	{
+		i++;
+		if (str != s) {
+			data.edge_num[1] = i - 1;             //num[0]为左标号，num[1]为右标号
+			if (flag == 1) {
+				CPU_Data.push_back(data);
+				flag = 0;
+			}
+			data.edge_num[0] = i;
+			data.str = s;
+			flag = 1;
+			str = s;
+		}
+		else;
+
+	}
+	if (inf.is_open()) inf.close();
+}
+
+
+__global__ void Init_position(int Std_time, int iteration_num, int *GPU_run_position) {
+	int blockId = blockIdx.y*gridDim.x + blockIdx.x;
+	int tid = blockId * blockDim.x*blockDim.y + threadIdx.y*blockDim.x + threadIdx.x;
+
+	int i = Std_time * Num_Flag[1];       //Num_flag[1]保存每次迭代的记录数量，i表示数据的其实偏移位置
+
+	if (tid < iteration_num) {
+		GPU_run_position[tid] = i + tid;
+	}
+}
+
+
+
+__global__ void Partition(int* GPU_Data, int *GPU_run_position, int *Partition_num, int iteration_num, int Std_time) {
+	int blockId = blockIdx.y*gridDim.x + blockIdx.x;
+	int tid = blockId * blockDim.x*blockDim.y + threadIdx.y*blockDim.x + threadIdx.x;
+
+	int i = Std_time * Num_Flag[1];       //Num_flag[1]保存每次迭代的记录数量，i表示数据的其实偏移位置
+
+	if (tid < iteration_num) {
+
+		int y = GPU_run_position[tid] * Num_Flag[2], j = 0;
+		int z = 0;
+		for (j = 0; j < Num_Flag[2]; j++) {
+			z += GPU_Data[y + j] * (j+1);
+		}
+		//	if (Std_time == 0 && tid<30) printf("编号%d划分为： %d\n", tid, z);
+		y = Num_Flag[0];
+		Partition_num[i + tid] = z % y;
+	}
+}
+
+
+
+__host__ void deal_dataset(vector<int> Node_vector,int V_size) {
+	int *plk = new int[V_size];
+	for (int n = 0; n < V_size; n++) {
+		plk[n] = Node_vector[n];
+	}
+	int Std_time = 0;
+	int iteration_num = 0;
+	int num1 = V_size  / Iteration_recordNum;
+	int num2 = V_size % Iteration_recordNum;
+	if (num2 != 0) num1++;
+	while (Std_time < num1) {
+		if (Std_time == num1 - 1 && num2 != 0) {
+			iteration_num = num2;
+		}
+		else {
+			iteration_num = Iteration_recordNum;
+		}
+		cout << "复制前：  " << endl;
+		//数据位置初始化
+		HANDLE_ERROR(cudaMemcpy(GPU_run_position,plk+Iteration_recordNum*Std_time,iteration_num*sizeof(int),cudaMemcpyHostToDevice));
+		Model_Train(iteration_num);
+		cout << "复制后：  " << endl;
+		
+		Std_time++;
+		//system("pause");
+	}
+}
+
+
+ void Model_Train(int iteration_num) {
+	
+	Train_Forward << <grid, block >> > (GPU_run_position, GPU_Data,GPU_run_result, iteration_num);
+	Offset_average << <grid, block , sharedMem_size >> > (GPU_run_result, GPU_aim_num, GPU_run_position,public_memory,iteration_num);
+	//sum_average << <1, block_num, sharedMem_size >> > (public_memory,public_memory,block_num);
+
+	for (int i = 0; i < Key_Length; i++) {
+
+	}
+	system("pause");
+	//cudaDeviceSynchronize();
+}
+
+
+__global__ void Train_Forward(int *GPU_run_position, int *GPU_Data, float *GPU_run_result,int iteration_num) {
+	int blockId = blockIdx.y*gridDim.x + blockIdx.x;
+	int tid = blockId * blockDim.x*blockDim.y + threadIdx.y*blockDim.x + threadIdx.x;
+
+	int j = 0, offset = GPU_run_position[tid] *Num_Flag[2];           //键值，距离起始地址的偏移量
+
+	float result = 0.0;
+	if (tid < iteration_num) {
+		for (j = 0; j < Num_Flag[2]; j++)
+			result += GPU_Data[offset + j] * GPU_Param[j];
+		result += GPU_Param[j];
+		GPU_run_result[tid] = result;
+		if (tid < 3) printf("编号：  %d   ,结果：   %f  \n", tid, GPU_run_result[tid]);
+	}
+}
+
+
+__global__ void Offset_average(float *input,int *GPU_aim_num,int* GPU_run_position, float *sum_result,int length) {
+	int threadId = threadIdx.x + threadIdx.y*blockDim.x;
+	int blockId = blockIdx.x + blockIdx.y*gridDim.x;
+	int tid = threadId + (blockDim.x*blockDim.y)*blockId;
+	extern __shared__ float sdata[];
+	float x = 0.0;
+	if (tid < length)
+	{
+		int offset2 = GPU_run_position[tid];
+		x =  2 * (input[tid] - GPU_aim_num[offset2]);
+		if (tid < 30)
+			printf("YYGGG:   %d \n", x);
+	}
+	sdata[threadIdx.x] = x;
+	
+	__syncthreads();           //等待所有线程把自己负责的元素载入到共享内存
+
+	for (int offset = blockDim.x*blockDim.y / 2; offset > 0; offset >>= 1)     //offset >>= 1等价于offset/2,现在进行的是线程块内的计算
+	{
+		if (threadId < offset)//控制只有某些线程才进行操作。
+		{
+			sdata[threadId] += sdata[threadId + offset];
+		}
+		__syncthreads();
+	}
+	if (threadId == 0)
+	{
+		sum_result[blockId] = sdata[0];
+		
+	}
+}
+
+
+
+
+
+__global__ void sum_average(float *input, float *sum_result, int length) {
+	int threadId = threadIdx.x + threadIdx.y*blockDim.x;
+	int blockId = blockIdx.x + blockIdx.y*gridDim.x;
+	int tid = threadId + (blockDim.x*blockDim.y)*blockId;
+	extern __shared__ float sdata[];
+	float x = 0.0;
+	if (tid < length)
+	{
+		x = input[tid];
+	}
+	sdata[threadIdx.x] = x;
+	__syncthreads();           //等待所有线程把自己负责的元素载入到共享内存
+
+	for (int offset = blockDim.x*blockDim.y / 2; offset > 0; offset >>= 1)     //offset >>= 1等价于offset/2,现在进行的是线程块内的计算
+	{
+		if (threadId < offset)//控制只有某些线程才进行操作。
+		{
+			sdata[threadId] += sdata[threadId + offset];
+		}
+		__syncthreads();
+	}
+	if (threadId == 0)
+	{
+		sum_result[blockId] = sdata[0];
+		printf("YY:   %d \n",sdata[0]);
+	}
+}
+
+
+
+
+
+
+__global__ void show() {
+	printf("%d    ",  Model_Param[2]);
+}
+
+
